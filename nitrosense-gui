@@ -1,0 +1,819 @@
+#!/usr/bin/env python3
+
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import threading
+from datetime import datetime
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gdk", "3.0")
+gi.require_version("Gtk", "3.0")
+from gi.repository import GLib, Gdk, Gtk
+
+APP_ID = "com.adriz.nitrosense"
+CONFIG_DIR = Path.home() / ".config" / "nitrosense-gui"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+POWER_MODES = {
+    "q": {"name": "Quiet", "desc": "Battery-friendly and low-noise"},
+    "d": {"name": "Default", "desc": "Balanced everyday use"},
+    "p": {"name": "Performance", "desc": "Maximum sustained performance"},
+}
+
+FAN_MODES = {
+    "a": {"name": "Auto", "desc": "EC-managed thermal control"},
+    "c": {"name": "Custom", "desc": "Fixed fan level for CPU and GPU"},
+    "m": {"name": "Max", "desc": "Full speed for best cooling"},
+}
+
+
+class NitroSenseWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="NitroSense Controller")
+        self.set_default_size(1280, 760)
+        self.set_border_width(0)
+
+        self.script_path = self._resolve_backend_script()
+        self.auth_mode = self._detect_auth_mode()
+        self.running = False
+        self.profile_loaded = False
+
+        self.power_buttons = {}
+        self.fan_buttons = {}
+        self.selected_power = "d"
+        self.selected_fan = "a"
+        self.last_command = ""
+        self.quitting = False
+        self.tray = None
+
+        self._load_css()
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root.get_style_context().add_class("app-root")
+        self.add(root)
+
+        header = Gtk.HeaderBar()
+        header.set_show_close_button(True)
+        header.set_title("NitroSense Controller")
+        header.set_subtitle("Acer Nitro AN515-58 Linux")
+        header.get_style_context().add_class("topbar")
+        self.set_titlebar(header)
+
+        self.spinner = Gtk.Spinner()
+        self.spinner.set_no_show_all(True)
+        header.pack_end(self.spinner)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        body.set_margin_top(14)
+        body.set_margin_bottom(14)
+        body.set_margin_start(14)
+        body.set_margin_end(14)
+        root.pack_start(body, True, True, 0)
+
+        left_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        left_panel.set_hexpand(True)
+        body.pack_start(left_panel, True, True, 0)
+
+        right_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        right_panel.set_size_request(390, -1)
+        right_panel.get_style_context().add_class("output-panel")
+        right_panel.set_margin_top(2)
+        right_panel.set_margin_bottom(2)
+        body.pack_start(right_panel, False, True, 0)
+
+        left_panel.pack_start(self._build_mode_section("Power Profile", POWER_MODES, self.power_buttons, self._on_power_clicked), False, False, 0)
+        left_panel.pack_start(self._build_mode_section("Fan Profile", FAN_MODES, self.fan_buttons, self._on_fan_clicked), False, False, 0)
+        left_panel.pack_start(self._build_custom_section(), False, False, 0)
+        left_panel.pack_start(self._build_quick_actions(), False, False, 0)
+
+        self.apply_btn = Gtk.Button(label="Apply Profile")
+        self.apply_btn.connect("clicked", self._on_apply_clicked)
+        self.apply_btn.get_style_context().add_class("apply-btn")
+        self.apply_btn.set_margin_top(4)
+        left_panel.pack_end(self.apply_btn, False, False, 0)
+
+        self._build_output_panel(right_panel)
+        self._setup_shortcuts()
+        self._setup_tray()
+        self.connect("delete-event", self._on_delete_event)
+
+        self._set_power_mode("d")
+        self._set_fan_mode("a")
+        self.fan_scale.set_value(50)
+
+        self._load_profile()
+        self._update_ui_state()
+        self._check_prereqs()
+
+    def _resolve_backend_script(self):
+        env_path = os.environ.get("NITROSENSE_BACKEND", "").strip()
+        candidates = []
+        if env_path:
+            candidates.append(Path(env_path).expanduser())
+        candidates.extend(
+            [
+                Path(__file__).resolve().parent / "nitrosense",
+                Path("/usr/lib/nitrosense/nitrosense"),
+            ]
+        )
+
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate.resolve())
+        return str((Path(__file__).resolve().parent / "nitrosense").resolve())
+
+    def _load_css(self):
+        css = b"""
+        .app-root {
+            background-image: linear-gradient(180deg, #0d1020 0%, #090b14 100%);
+        }
+        .topbar {
+            background: #0c0f1f;
+            color: #e8ecff;
+        }
+        .section {
+            background: rgba(18, 22, 40, 0.86);
+            border: 1px solid rgba(154, 176, 255, 0.12);
+            border-radius: 12px;
+            padding: 14px;
+        }
+        .section-title {
+            color: #a9b9e8;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+        }
+        .card {
+            min-height: 96px;
+            border-radius: 10px;
+            border: 1px solid rgba(186, 201, 255, 0.16);
+            background: rgba(36, 42, 66, 0.56);
+            color: #ecf1ff;
+            padding: 8px;
+        }
+        .card:hover {
+            border-color: rgba(186, 201, 255, 0.28);
+            background: rgba(46, 54, 82, 0.72);
+        }
+        .power-active {
+            border: 1px solid rgba(153, 108, 255, 0.9);
+            box-shadow: 0 0 0 1px rgba(153, 108, 255, 0.5);
+            background: rgba(83, 52, 138, 0.36);
+        }
+        .fan-active {
+            border: 1px solid rgba(0, 214, 179, 0.9);
+            box-shadow: 0 0 0 1px rgba(0, 214, 179, 0.55);
+            background: rgba(18, 78, 74, 0.38);
+        }
+        .desc {
+            color: #9fb0df;
+            font-size: 12px;
+        }
+        .custom-value {
+            color: #35e0c6;
+            font-weight: 700;
+            font-size: 30px;
+        }
+        .apply-btn {
+            min-height: 44px;
+            border-radius: 12px;
+            border: none;
+            color: #ffffff;
+            background-image: linear-gradient(90deg, #7f43ff 0%, #b255ff 100%);
+            font-weight: 700;
+            font-size: 16px;
+        }
+        .output-panel {
+            border-radius: 12px;
+            border: 1px solid rgba(156, 178, 255, 0.14);
+            background: rgba(10, 13, 26, 0.94);
+            padding: 10px;
+        }
+        .output-title {
+            color: #97acd8;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+        }
+        .output-hint {
+            color: #7f90be;
+            font-size: 12px;
+        }
+        .status-ok {
+            color: #3ed7ad;
+            font-weight: 700;
+        }
+        .status-bad {
+            color: #ff6f8f;
+            font-weight: 700;
+        }
+        .mono {
+            font-family: "Ubuntu Mono", monospace;
+            color: #8dd8c8;
+        }
+        """
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css)
+        screen = Gdk.Screen.get_default()
+        if screen is not None:
+            Gtk.StyleContext.add_provider_for_screen(screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def _build_mode_section(self, title, modes, button_map, callback):
+        frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        frame.get_style_context().add_class("section")
+
+        label = Gtk.Label(label=title)
+        label.set_xalign(0)
+        label.get_style_context().add_class("section-title")
+        frame.pack_start(label, False, False, 0)
+
+        grid = Gtk.Grid(column_spacing=10, row_spacing=10)
+        frame.pack_start(grid, False, False, 0)
+
+        for col, (key, meta) in enumerate(modes.items()):
+            btn = Gtk.Button()
+            btn.mode_key = key
+            btn.connect("clicked", callback)
+            btn.get_style_context().add_class("card")
+            btn.set_hexpand(True)
+
+            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            content.set_margin_top(6)
+            content.set_margin_bottom(6)
+            content.set_margin_start(10)
+            content.set_margin_end(10)
+
+            name = Gtk.Label(label=meta["name"])
+            name.set_xalign(0.5)
+            name.set_justify(Gtk.Justification.CENTER)
+            name.get_style_context().add_class("section-title")
+            content.pack_start(name, False, False, 0)
+
+            desc = Gtk.Label(label=meta["desc"])
+            desc.set_xalign(0.5)
+            desc.set_line_wrap(True)
+            desc.set_justify(Gtk.Justification.CENTER)
+            desc.get_style_context().add_class("desc")
+            content.pack_start(desc, False, False, 0)
+
+            btn.add(content)
+            grid.attach(btn, col, 0, 1, 1)
+            button_map[key] = btn
+
+        return frame
+
+    def _build_custom_section(self):
+        section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        section.get_style_context().add_class("section")
+
+        title = Gtk.Label(label="Custom Fan Level")
+        title.set_xalign(0)
+        title.get_style_context().add_class("section-title")
+        section.pack_start(title, False, False, 0)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        section.pack_start(row, False, False, 0)
+
+        hint = Gtk.Label(label="Only active when Fan Profile is Custom")
+        hint.set_xalign(0)
+        hint.get_style_context().add_class("desc")
+        row.pack_start(hint, True, True, 0)
+
+        self.fan_pct_label = Gtk.Label(label="50%")
+        self.fan_pct_label.get_style_context().add_class("custom-value")
+        row.pack_end(self.fan_pct_label, False, False, 0)
+
+        self.fan_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+        self.fan_scale.set_digits(0)
+        self.fan_scale.set_draw_value(False)
+        self.fan_scale.connect("value-changed", self._on_scale_changed)
+        section.pack_start(self.fan_scale, False, False, 0)
+
+        marks = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        for pct in ["0%", "25%", "50%", "75%", "100%"]:
+            lbl = Gtk.Label(label=pct)
+            lbl.get_style_context().add_class("desc")
+            lbl.set_xalign(0.5)
+            lbl.set_hexpand(True)
+            marks.pack_start(lbl, True, True, 0)
+        section.pack_start(marks, False, False, 0)
+
+        return section
+
+    def _build_quick_actions(self):
+        section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        section.get_style_context().add_class("section")
+
+        title = Gtk.Label(label="Quick Actions")
+        title.set_xalign(0)
+        title.get_style_context().add_class("section-title")
+        section.pack_start(title, False, False, 0)
+
+        row = Gtk.Grid(column_spacing=10, row_spacing=10)
+        section.pack_start(row, False, False, 0)
+
+        self.nvidia_btn = Gtk.Button(label="Restart PowerD")
+        self.nvidia_btn.connect("clicked", self._on_nvidia_clicked)
+        self.nvidia_btn.get_style_context().add_class("card")
+        row.attach(self.nvidia_btn, 0, 0, 1, 1)
+
+        self.energy_btn = Gtk.Button(label="Read Energy")
+        self.energy_btn.connect("clicked", self._on_energy_clicked)
+        self.energy_btn.get_style_context().add_class("card")
+        row.attach(self.energy_btn, 1, 0, 1, 1)
+
+        self.ec_btn = Gtk.Button(label="Dump EC Regs")
+        self.ec_btn.connect("clicked", self._on_dump_ec_clicked)
+        self.ec_btn.get_style_context().add_class("card")
+        row.attach(self.ec_btn, 2, 0, 1, 1)
+
+        for btn in [self.nvidia_btn, self.energy_btn, self.ec_btn]:
+            btn.set_hexpand(True)
+            btn.set_size_request(-1, 64)
+
+        return section
+
+    def _build_output_panel(self, panel):
+        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        panel.pack_start(top, False, False, 0)
+
+        label = Gtk.Label(label="COMMAND OUTPUT")
+        label.set_xalign(0)
+        label.get_style_context().add_class("output-title")
+        top.pack_start(label, False, False, 0)
+
+        hint = Gtk.Label(label="Runtime logs from nitrosense backend")
+        hint.set_xalign(0)
+        hint.get_style_context().add_class("output-hint")
+        top.pack_start(hint, False, False, 0)
+
+        top_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        panel.pack_start(top_actions, False, False, 0)
+
+        copy_btn = Gtk.Button(label="Copy Command")
+        copy_btn.connect("clicked", self._on_copy_command_clicked)
+        top_actions.pack_start(copy_btn, False, False, 0)
+
+        clear_btn = Gtk.Button(label="Clear")
+        clear_btn.connect("clicked", self._on_clear_log_clicked)
+        top_actions.pack_end(clear_btn, False, False, 0)
+
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_hexpand(True)
+        scroller.set_vexpand(True)
+        panel.pack_start(scroller, True, True, 0)
+
+        self.output_view = Gtk.TextView()
+        self.output_view.set_editable(False)
+        self.output_view.set_cursor_visible(False)
+        self.output_view.set_monospace(True)
+        self.output_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.output_view.get_style_context().add_class("mono")
+        scroller.add(self.output_view)
+        self.output_buffer = self.output_view.get_buffer()
+
+        info_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        info_wrap.set_margin_top(6)
+        panel.pack_start(info_wrap, False, False, 0)
+
+        self.auth_label = Gtk.Label()
+        self.auth_label.set_xalign(0)
+        self.auth_label.get_style_context().add_class("desc")
+        info_wrap.pack_start(self.auth_label, False, False, 0)
+
+        status_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        panel.pack_end(status_wrap, False, False, 0)
+
+        self.status_label = Gtk.Label(label="Ready")
+        self.status_label.set_xalign(0)
+        self.status_label.get_style_context().add_class("status-ok")
+        status_wrap.pack_start(self.status_label, False, False, 0)
+
+        self.selection_label = Gtk.Label(label="")
+        self.selection_label.set_xalign(0)
+        self.selection_label.get_style_context().add_class("desc")
+        status_wrap.pack_start(self.selection_label, False, False, 0)
+
+        self.auth_label.set_text(f"Auth: {self._auth_mode_label()}")
+        self._append_output("NitroSense GUI initialized.\n")
+
+    def _setup_shortcuts(self):
+        accel = Gtk.AccelGroup()
+        self.add_accel_group(accel)
+        key_apply, mod_apply = Gtk.accelerator_parse("<Control>Return")
+        self.apply_btn.add_accelerator("clicked", accel, key_apply, mod_apply, Gtk.AccelFlags.VISIBLE)
+
+    def _setup_tray(self):
+        self.tray = Gtk.StatusIcon.new_from_icon_name("preferences-system")
+        self.tray.set_tooltip_text("NitroSense Controller")
+        self.tray.set_visible(True)
+        self.tray.connect("activate", self._on_tray_activate)
+        self.tray.connect("popup-menu", self._on_tray_popup)
+
+    def _on_tray_activate(self, _icon):
+        if self.is_visible():
+            self.hide()
+        else:
+            self.show_all()
+            self.present()
+
+    def _on_tray_popup(self, icon, button, activate_time):
+        menu = Gtk.Menu()
+
+        show_item = Gtk.MenuItem(label="Show / Hide")
+        show_item.connect("activate", lambda *_: self._on_tray_activate(icon))
+        menu.append(show_item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        quick_profiles = [
+            ("Quiet + Auto", "q", "a", None),
+            ("Default + Auto", "d", "a", None),
+            ("Performance + Max", "p", "m", None),
+            ("Default + Custom 50%", "d", "c", 50),
+        ]
+        for label, power, fan, pct in quick_profiles:
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate", self._on_tray_profile_activate, power, fan, pct)
+            menu.append(item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", self._on_tray_quit)
+        menu.append(quit_item)
+
+        menu.show_all()
+        menu.popup(None, None, Gtk.StatusIcon.position_menu, icon, button, activate_time)
+
+    def _on_tray_profile_activate(self, _item, power, fan, pct):
+        if self.running:
+            self._set_status("Command already running", ok=False)
+            return
+        self._set_power_mode(power)
+        self._set_fan_mode(fan)
+        if pct is not None:
+            self.fan_scale.set_value(pct)
+        args = [f"{power}{fan}"]
+        if fan == "c":
+            args.append(str(int(self.fan_scale.get_value())))
+        label = f"Tray apply {POWER_MODES[power]['name']} + {FAN_MODES[fan]['name']}"
+        self._run_backend(args, label)
+
+    def _on_tray_quit(self, _item):
+        self.quitting = True
+        if self.tray is not None:
+            self.tray.set_visible(False)
+        app = self.get_application()
+        if app is not None:
+            app.quit()
+
+    def _on_delete_event(self, _widget, _event):
+        if self.quitting:
+            return False
+        self.hide()
+        self._set_status("Window hidden to tray", ok=True)
+        return True
+
+    def _auth_mode_label(self):
+        if self.auth_mode == "sudo-n":
+            return "Passwordless sudo"
+        if self.auth_mode == "pkexec":
+            return "pkexec prompt"
+        return "root"
+
+    def _append_output(self, text):
+        end = self.output_buffer.get_end_iter()
+        self.output_buffer.insert(end, text)
+        mark = self.output_buffer.create_mark(None, self.output_buffer.get_end_iter(), False)
+        self.output_view.scroll_to_mark(mark, 0.0, True, 0.0, 1.0)
+
+    def _set_status(self, text, ok=True):
+        self.status_label.set_text(text)
+        ctx = self.status_label.get_style_context()
+        if ok:
+            ctx.add_class("status-ok")
+            ctx.remove_class("status-bad")
+        else:
+            ctx.add_class("status-bad")
+            ctx.remove_class("status-ok")
+
+    def _check_prereqs(self):
+        if not os.path.isfile(self.script_path):
+            self._set_status(f"Missing backend script: {self.script_path}", ok=False)
+            self._set_controls_sensitive(False)
+            return
+        if not os.access(self.script_path, os.X_OK):
+            self._set_status(f"Backend script is not executable: {self.script_path}", ok=False)
+            self._set_controls_sensitive(False)
+            return
+        if self.auth_mode == "pkexec" and shutil.which("pkexec") is None and os.geteuid() != 0:
+            self._set_status("pkexec not found. Install policykit-1 or run as root.", ok=False)
+            self._set_controls_sensitive(False)
+            return
+
+        if self.auth_mode == "sudo-n":
+            self._set_status("Ready (passwordless sudo mode enabled)", ok=True)
+        elif self.auth_mode == "root":
+            self._set_status("Ready (running as root)", ok=True)
+        else:
+            self._set_status("Ready (pkexec authentication mode)", ok=True)
+
+    def _detect_auth_mode(self):
+        if os.geteuid() == 0:
+            return "root"
+        if self._has_passwordless_sudo():
+            return "sudo-n"
+        return "pkexec"
+
+    def _has_passwordless_sudo(self):
+        if shutil.which("sudo") is None:
+            return False
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "true"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _set_running(self, running):
+        self.running = running
+        if running:
+            self.spinner.show()
+            self.spinner.start()
+        else:
+            self.spinner.stop()
+            self.spinner.hide()
+        self._set_controls_sensitive(not running)
+
+    def _set_controls_sensitive(self, enabled):
+        self.apply_btn.set_sensitive(enabled)
+        self.nvidia_btn.set_sensitive(enabled)
+        self.energy_btn.set_sensitive(enabled)
+        self.ec_btn.set_sensitive(enabled)
+        for btn in self.power_buttons.values():
+            btn.set_sensitive(enabled)
+        for btn in self.fan_buttons.values():
+            btn.set_sensitive(enabled)
+        self.fan_scale.set_sensitive(enabled and self.selected_fan == "c")
+
+    def _set_power_mode(self, key):
+        self.selected_power = key
+        for mode, btn in self.power_buttons.items():
+            ctx = btn.get_style_context()
+            if mode == key:
+                ctx.add_class("power-active")
+            else:
+                ctx.remove_class("power-active")
+        self._update_ui_state()
+
+    def _set_fan_mode(self, key):
+        self.selected_fan = key
+        for mode, btn in self.fan_buttons.items():
+            ctx = btn.get_style_context()
+            if mode == key:
+                ctx.add_class("fan-active")
+            else:
+                ctx.remove_class("fan-active")
+        self._update_ui_state()
+
+    def _on_power_clicked(self, btn):
+        self._set_power_mode(btn.mode_key)
+
+    def _on_fan_clicked(self, btn):
+        self._set_fan_mode(btn.mode_key)
+
+    def _on_scale_changed(self, _scale):
+        self._update_ui_state()
+
+    def _build_command(self, args):
+        if self.auth_mode == "root":
+            return [self.script_path, *args]
+        if self.auth_mode == "sudo-n":
+            return ["sudo", "-n", "/bin/bash", self.script_path, *args]
+        safe_path = "/usr/sbin:/usr/bin:/sbin:/bin"
+        home = os.environ.get("HOME", str(Path.home()))
+        return [
+            "pkexec",
+            "/usr/bin/env",
+            f"PATH={safe_path}",
+            f"HOME={home}",
+            "/bin/bash",
+            self.script_path,
+            *args,
+        ]
+
+    def _update_ui_state(self):
+        pct = int(self.fan_scale.get_value())
+        self.fan_pct_label.set_text(f"{pct}%")
+
+        args = [f"{self.selected_power}{self.selected_fan}"]
+        if self.selected_fan == "c":
+            args.append(str(pct))
+
+        profile_text = (
+            f"Power: {POWER_MODES[self.selected_power]['name']}  |  "
+            f"Fan: {FAN_MODES[self.selected_fan]['name']}"
+        )
+        if self.selected_fan == "c":
+            profile_text += f" ({pct}%)"
+
+        self.selection_label.set_text(profile_text)
+        self.fan_scale.set_sensitive(not self.running and self.selected_fan == "c")
+
+        if self.profile_loaded:
+            self._save_profile(self.selected_power, self.selected_fan, pct)
+
+    def _run_backend(self, args, label):
+        if self.running:
+            self._set_status("A command is already running", ok=False)
+            return
+
+        cmd = self._build_command(args)
+        self.last_command = shlex.join(cmd)
+        self._append_output(f"\n[{self._now()}] $ {self.last_command}\n")
+        self._set_status(f"Running: {label}")
+        self._set_running(True)
+
+        def worker():
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    GLib.idle_add(self._append_output, line)
+
+                rc = proc.wait()
+                if rc != 0 and self.auth_mode == "sudo-n":
+                    GLib.idle_add(self._append_output, f"[{self._now()}] sudo -n failed, retrying with pkexec...\n")
+                    retry_rc = self._run_with_pkexec(args)
+                    if retry_rc == 0:
+                        GLib.idle_add(self._set_status, f"Done: {label} (pkexec fallback)", True)
+                        return
+                    rc = retry_rc
+
+                if rc == 0:
+                    GLib.idle_add(self._set_status, f"Done: {label}", True)
+                else:
+                    GLib.idle_add(self._set_status, f"Failed ({rc}): {label}", False)
+            except Exception as exc:
+                GLib.idle_add(self._append_output, f"Error: {exc}\n")
+                GLib.idle_add(self._set_status, f"Error: {label}", False)
+            finally:
+                GLib.idle_add(self._set_running, False)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _run_with_pkexec(self, args):
+        safe_path = "/usr/sbin:/usr/bin:/sbin:/bin"
+        home = os.environ.get("HOME", str(Path.home()))
+        cmd = [
+            "pkexec",
+            "/usr/bin/env",
+            f"PATH={safe_path}",
+            f"HOME={home}",
+            "/bin/bash",
+            self.script_path,
+            *args,
+        ]
+        self.last_command = shlex.join(cmd)
+        GLib.idle_add(self._append_output, f"[{self._now()}] $ {self.last_command}\n")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            GLib.idle_add(self._append_output, line)
+        self.auth_mode = "pkexec"
+        GLib.idle_add(self.auth_label.set_text, f"Auth: {self._auth_mode_label()}")
+        return proc.wait()
+
+    def _now(self):
+        return datetime.now().strftime("%H:%M:%S")
+
+    def _confirm_high_profile(self):
+        pct = int(self.fan_scale.get_value())
+        aggressive = self.selected_power == "p" or self.selected_fan == "m" or (
+            self.selected_fan == "c" and pct >= 80
+        )
+        if not aggressive:
+            return True
+
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Apply high-performance profile?",
+        )
+        dialog.format_secondary_text(
+            "This can increase fan noise, heat output, and power draw."
+        )
+        response = dialog.run()
+        dialog.destroy()
+        return response == Gtk.ResponseType.OK
+
+    def _on_apply_clicked(self, _btn):
+        if not self._confirm_high_profile():
+            self._set_status("Cancelled profile apply", ok=False)
+            return
+
+        pct = int(self.fan_scale.get_value())
+        args = [f"{self.selected_power}{self.selected_fan}"]
+        label = f"Apply {POWER_MODES[self.selected_power]['name']} + {FAN_MODES[self.selected_fan]['name']}"
+        if self.selected_fan == "c":
+            args.append(str(pct))
+            label += f" ({pct}%)"
+
+        self._run_backend(args, label)
+
+    def _on_nvidia_clicked(self, _btn):
+        self._run_backend(["n"], "Restart NVIDIA PowerD")
+
+    def _on_energy_clicked(self, _btn):
+        self._run_backend(["e"], "Read energy data")
+
+    def _on_dump_ec_clicked(self, _btn):
+        self._run_backend(["r"], "Dump EC registers")
+
+    def _on_clear_log_clicked(self, _btn):
+        self.output_buffer.set_text("")
+        self._append_output(f"[{self._now()}] Output cleared.\n")
+
+    def _on_copy_command_clicked(self, _btn):
+        if not self.last_command:
+            self._set_status("No command to copy yet", ok=False)
+            return
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_text(self.last_command, -1)
+        self._set_status("Last command copied to clipboard", ok=True)
+
+    def _load_profile(self):
+        power = "d"
+        fan = "a"
+        pct = 50
+
+        try:
+            if CONFIG_FILE.is_file():
+                data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                power = data.get("power", power)
+                fan = data.get("fan", fan)
+                pct = int(data.get("fan_pct", pct))
+        except Exception:
+            pass
+
+        if power not in POWER_MODES:
+            power = "d"
+        if fan not in FAN_MODES:
+            fan = "a"
+        pct = max(0, min(100, pct))
+
+        self._set_power_mode(power)
+        self._set_fan_mode(fan)
+        self.fan_scale.set_value(pct)
+        self.profile_loaded = True
+
+    def _save_profile(self, power, fan, pct):
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            CONFIG_FILE.write_text(
+                json.dumps({"power": power, "fan": fan, "fan_pct": pct}, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+
+class NitroSenseApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+
+    def do_activate(self):
+        win = NitroSenseWindow(self)
+        win.show_all()
+        win.present()
+
+
+def main():
+    app = NitroSenseApp()
+    app.run(None)
+
+
+if __name__ == "__main__":
+    main()

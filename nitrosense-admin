@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+	cat <<'USAGE'
+NitroSense Admin Utility
+
+Usage:
+  ./nitrosense-admin <command> [args]
+
+Commands:
+  build-deb [version]
+      Build .deb package in ./dist (default version: 0.1.0)
+
+  sudoers-install [username]
+      Install passwordless sudoers rule for nitrosense backend.
+      If username is omitted, SUDO_USER is used.
+
+  sudoers-remove [username]
+      Remove passwordless sudoers rule.
+      If username is omitted, SUDO_USER is used.
+
+  help
+      Show this message.
+USAGE
+}
+
+die() {
+	echo "[nitrosense-admin][error] $*" >&2
+	exit 1
+}
+
+info() {
+	echo "[nitrosense-admin] $*"
+}
+
+resolve_backend_script() {
+	local repo_backend="${SCRIPT_DIR}/nitrosense"
+	local installed_backend="/usr/lib/nitrosense/nitrosense"
+
+	if [[ -f "${repo_backend}" ]]; then
+		echo "${repo_backend}"
+		return
+	fi
+	if [[ -f "${installed_backend}" ]]; then
+		echo "${installed_backend}"
+		return
+	fi
+	die "Cannot find nitrosense backend script"
+}
+
+require_root() {
+	if [[ "${EUID}" -eq 0 ]]; then
+		return 0
+	fi
+	exec sudo --preserve-env=HOME,SUDO_USER bash "$0" "$@"
+}
+
+target_user_from_args() {
+	local input_user="${1:-}"
+	if [[ -n "${input_user}" ]]; then
+		echo "${input_user}"
+		return
+	fi
+	if [[ -n "${SUDO_USER:-}" ]]; then
+		echo "${SUDO_USER}"
+		return
+	fi
+	die "No target username provided and SUDO_USER is empty"
+}
+
+sudoers_install() {
+	require_root "$@"
+
+	local target_user backend backend_escaped sudoers_file rule
+	target_user="$(target_user_from_args "${1:-}")"
+	backend="$(resolve_backend_script)"
+	backend_escaped="${backend// /\\ }"
+	sudoers_file="/etc/sudoers.d/nitrosense-gui-${target_user}"
+
+	rule="${target_user} ALL=(root) NOPASSWD: /bin/bash ${backend_escaped} *"
+	printf '%s\n' "${rule}" > "${sudoers_file}"
+	chmod 440 "${sudoers_file}"
+
+	if ! visudo -cf "${sudoers_file}" >/dev/null; then
+		rm -f "${sudoers_file}"
+		die "Generated sudoers file failed validation"
+	fi
+
+	info "Installed ${sudoers_file}"
+	info "Rule: /bin/bash ${backend} *"
+}
+
+sudoers_remove() {
+	require_root "$@"
+
+	local target_user sudoers_file
+	target_user="$(target_user_from_args "${1:-}")"
+	sudoers_file="/etc/sudoers.d/nitrosense-gui-${target_user}"
+
+	if [[ -f "${sudoers_file}" ]]; then
+		rm -f "${sudoers_file}"
+		info "Removed ${sudoers_file}"
+	else
+		info "No sudoers file found at ${sudoers_file}"
+	fi
+}
+
+build_deb() {
+	local version="${1:-0.1.0}"
+	local pkg_name="nitrosense-gui"
+	local arch build_root dist_dir build_dir deb_path
+
+	[[ -f "${SCRIPT_DIR}/nitrosense-gui" ]] || die "Run from repository root (missing nitrosense-gui)"
+	[[ -f "${SCRIPT_DIR}/nitrosense" ]] || die "Run from repository root (missing nitrosense)"
+	[[ -f "${SCRIPT_DIR}/README.md" ]] || die "Run from repository root (missing README.md)"
+	[[ -f "${SCRIPT_DIR}/packaging/nitrosense-gui.desktop" ]] || die "Missing packaging/nitrosense-gui.desktop"
+
+	arch="$(dpkg --print-architecture)"
+	build_root="${SCRIPT_DIR}"
+	dist_dir="${build_root}/dist"
+	build_dir="${dist_dir}/${pkg_name}_${version}_${arch}"
+	deb_path="${dist_dir}/${pkg_name}_${version}_${arch}.deb"
+
+	mkdir -p "${dist_dir}"
+	rm -rf "${build_dir}" "${deb_path}"
+
+	mkdir -p "${build_dir}/DEBIAN"
+	mkdir -p "${build_dir}/usr/bin"
+	mkdir -p "${build_dir}/usr/lib/nitrosense"
+	mkdir -p "${build_dir}/usr/share/applications"
+	mkdir -p "${build_dir}/usr/share/doc/${pkg_name}"
+
+	cat > "${build_dir}/DEBIAN/control" <<EOF
+Package: ${pkg_name}
+Version: ${version}
+Section: utils
+Priority: optional
+Architecture: ${arch}
+Maintainer: adriz <adriz@localhost>
+Depends: bash, python3, python3-gi, gir1.2-gtk-3.0, policykit-1, sudo
+Description: NitroSense GUI controller for Acer Nitro Linux EC script
+ GTK-based controller for power and fan profiles with the bundled
+ nitrosense backend.
+EOF
+
+	install -m 755 "${build_root}/nitrosense-gui" "${build_dir}/usr/bin/nitrosense-gui"
+	install -m 755 "${build_root}/nitrosense-admin" "${build_dir}/usr/bin/nitrosense-admin"
+	install -m 755 "${build_root}/nitrosense" "${build_dir}/usr/lib/nitrosense/nitrosense"
+	install -m 644 "${build_root}/packaging/nitrosense-gui.desktop" "${build_dir}/usr/share/applications/nitrosense-gui.desktop"
+	install -m 644 "${build_root}/README.md" "${build_dir}/usr/share/doc/${pkg_name}/README.md"
+
+	dpkg-deb --build --root-owner-group "${build_dir}" "${deb_path}"
+	info "Built package: ${deb_path}"
+}
+
+main() {
+	local cmd="${1:-help}"
+	shift || true
+
+	case "${cmd}" in
+		build-deb) build_deb "$@" ;;
+		sudoers-install) sudoers_install "$@" ;;
+		sudoers-remove) sudoers_remove "$@" ;;
+		help|-h|--help) usage ;;
+		*) die "Unknown command: ${cmd}" ;;
+	esac
+}
+
+main "$@"

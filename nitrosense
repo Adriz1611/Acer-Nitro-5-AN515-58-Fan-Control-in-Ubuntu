@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+EC_PATH="/sys/kernel/debug/ec/ec0/io"
+LOCAL_EC_MODULE="${HOME}/ec_sys.ko"
+
+# Global flags parsed from CLI.
+declare -A FLAG=()
+CUSTOM_PCT=""
+UNKNOWN_TOKENS=()
+
+print_usage() {
+	cat <<'USAGE'
+NitroSense EC Controller (Linux)
+
+Usage:
+  sudo bash nitrosense <flags> [custom_percent]
+
+Flags:
+  w  Ensure EC write interface is enabled (maintenance/no-op)
+
+  q  Quiet power profile
+  d  Default power profile
+  p  Performance power profile
+
+  a  Fan auto
+  c  Fan custom (requires custom_percent: 0-100)
+  m  Fan max
+
+  r  Dump EC register map
+  x  Alias of r
+  e  Read Intel RAPL energy counters
+  n  Restart nvidia-powerd service
+
+Examples:
+  sudo bash nitrosense da
+  sudo bash nitrosense pm
+  sudo bash nitrosense pc 50
+  sudo bash nitrosense e
+USAGE
+}
+
+log() {
+	echo "[nitrosense] $*"
+}
+
+warn() {
+	echo "[nitrosense][warn] $*" >&2
+}
+
+die() {
+	echo "[nitrosense][error] $*" >&2
+	exit 1
+}
+
+needs_root() {
+	if [[ ${EUID} -eq 0 ]]; then
+		return 0
+	fi
+	exec sudo --preserve-env=HOME bash "$0" "$@"
+}
+
+parse_args() {
+	local token ch i
+	for token in "$@"; do
+		if [[ "$token" =~ ^[0-9]+$ ]]; then
+			CUSTOM_PCT="$token"
+			continue
+		fi
+
+		for ((i=0; i<${#token}; i++)); do
+			ch="${token:i:1}"
+			case "$ch" in
+				w|q|d|p|a|c|m|r|x|e|n)
+					FLAG["$ch"]=1
+					;;
+				-)
+					# Ignore '-' in tokens like '--help' (handled before parse).
+					;;
+				*)
+					UNKNOWN_TOKENS+=("$ch")
+					;;
+			esac
+		done
+	done
+}
+
+any_flag_set() {
+	local key
+	for key in "$@"; do
+		if [[ -n "${FLAG[$key]:-}" ]]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+safe_write() {
+	local path="$1" value="$2"
+	if [[ -w "$path" ]]; then
+		echo "$value" > "$path"
+	else
+		warn "Cannot write '$value' to $path"
+	fi
+}
+
+enable_msr_writes() {
+	if [[ -w /sys/module/msr/parameters/allow_writes ]]; then
+		echo on > /sys/module/msr/parameters/allow_writes
+	fi
+}
+
+reload_ec_module() {
+	if lsmod | awk '{print $1}' | grep -qx ec_sys; then
+		if [[ -f "$LOCAL_EC_MODULE" ]]; then
+			rmmod ec_sys || true
+		else
+			modprobe -r ec_sys || true
+		fi
+	fi
+
+	if [[ -f "$LOCAL_EC_MODULE" ]]; then
+		insmod "$LOCAL_EC_MODULE" write_support=1 || {
+			dmesg | tail -n 20
+			die "Failed to insert local ec_sys module"
+		}
+	else
+		modprobe ec_sys write_support=1 || {
+			dmesg | tail -n 20
+			die "Failed to load ec_sys module"
+		}
+	fi
+}
+
+ensure_ec_ready() {
+	reload_ec_module
+	[[ -e "$EC_PATH" ]] || die "EC interface not enabled at $EC_PATH"
+}
+
+ec_write_byte() {
+	local offset="$1" byte_seq="$2"
+	# shellcheck disable=SC2059
+	printf "$byte_seq" | dd of="$EC_PATH" bs=1 seek="$offset" count=1 conv=notrunc status=none
+}
+
+set_power_limits() {
+	local pl1_w="$1" pl2_w="$2" governor="$3"
+	local rapl_nodes=(
+		"/sys/devices/virtual/powercap/intel-rapl/intel-rapl:0"
+		"/sys/devices/virtual/powercap/intel-rapl-mmio/intel-rapl-mmio:0"
+	)
+
+	local gov
+	for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+		[[ -w "$gov" ]] && echo "$governor" > "$gov"
+	done
+
+	local epp
+	for epp in /sys/devices/system/cpu/cpufreq/policy*/energy_performance_preference; do
+		[[ -w "$epp" ]] && echo "$governor" > "$epp"
+	done
+
+	local node node_name
+	for node in "${rapl_nodes[@]}"; do
+		[[ -d "$node" ]] || continue
+
+		safe_write "$node/constraint_0_power_limit_uw" "${pl1_w}000000"
+		safe_write "$node/constraint_1_power_limit_uw" "${pl2_w}000000"
+		safe_write "$node/constraint_0_time_window_us" "128000000"
+		safe_write "$node/constraint_1_time_window_us" "128000000"
+
+		if [[ "$node" == *"mmio"* ]]; then
+			node_name="MCH"
+		else
+			node_name="MSR"
+		fi
+
+		log "[$node_name] PL1 [$(cat "$node/constraint_0_power_limit_uw" 2>/dev/null || echo '?') $(cat "$node/constraint_0_time_window_us" 2>/dev/null || echo '?')] PL2 [$(cat "$node/constraint_1_power_limit_uw" 2>/dev/null || echo '?') $(cat "$node/constraint_1_time_window_us" 2>/dev/null || echo '?')]"
+	done
+}
+
+apply_power_quiet() {
+	log "Power profile: Quiet"
+	ec_write_byte $((0x2c)) '\x00'
+	ec_write_byte $((0x2d)) '\x04'
+	set_power_limits 10 10 "powersave"
+	safe_write "/sys/module/pcie_aspm/parameters/policy" "powersupersave"
+
+	local epp
+	for epp in /sys/devices/system/cpu/cpufreq/policy*/energy_performance_preference; do
+		[[ -w "$epp" ]] && echo power > "$epp"
+	done
+}
+
+apply_power_default() {
+	log "Power profile: Default"
+	ec_write_byte $((0xab)) '\x0a'
+	ec_write_byte $((0x2c)) '\x01'
+	ec_write_byte $((0x2d)) '\x04'
+	set_power_limits 75 75 "performance"
+	safe_write "/sys/module/pcie_aspm/parameters/policy" "performance"
+}
+
+apply_power_performance() {
+	log "Power profile: Performance"
+	ec_write_byte $((0xab)) '\x0a'
+	ec_write_byte $((0x2c)) '\x04'
+	ec_write_byte $((0x2d)) '\x04'
+	set_power_limits 95 95 "performance"
+	safe_write "/sys/module/pcie_aspm/parameters/policy" "performance"
+}
+
+apply_fan_auto() {
+	log "Fan profile: Auto"
+	ec_write_byte $((0x21)) '\x10'
+	ec_write_byte $((0x22)) '\x04'
+}
+
+apply_fan_custom() {
+	if [[ -z "$CUSTOM_PCT" ]]; then
+		warn "Custom fan selected but no percent provided"
+		return
+	fi
+	if ! [[ "$CUSTOM_PCT" =~ ^[0-9]+$ ]] || (( CUSTOM_PCT < 0 || CUSTOM_PCT > 100 )); then
+		die "Custom fan percent must be an integer between 0 and 100"
+	fi
+
+	local pct_hex
+	pct_hex="\\x$(printf '%02x' "$CUSTOM_PCT")"
+	log "Fan profile: Custom (${CUSTOM_PCT}%)"
+	ec_write_byte $((0x21)) '\x30'
+	ec_write_byte $((0x22)) '\x0c'
+	ec_write_byte $((0x37)) "$pct_hex"
+	ec_write_byte $((0x3a)) "$pct_hex"
+}
+
+apply_fan_max() {
+	log "Fan profile: Max"
+	ec_write_byte $((0x21)) '\x20'
+	ec_write_byte $((0x22)) '\x08'
+}
+
+dump_ec_registers() {
+	ensure_ec_ready
+	log "Dumping EC register map"
+	xxd -g1 "$EC_PATH"
+}
+
+print_energy_uj() {
+	log "Reading Intel RAPL energy counters"
+	find /sys/devices/virtual/powercap -type f -iname "energy_uj" -print | while read -r f; do
+		echo -e "$f\n$(cat "$f")"
+	done
+}
+
+restart_nvidia_powerd() {
+	log "Restarting nvidia-powerd"
+	systemctl restart nvidia-powerd
+}
+
+run_ec_actions() {
+	if ! any_flag_set w q d p a c m; then
+		return
+	fi
+
+	ensure_ec_ready
+	enable_msr_writes
+	ec_write_byte $((0x03)) '\x11'
+
+	[[ -n "${FLAG[q]:-}" ]] && apply_power_quiet
+	[[ -n "${FLAG[d]:-}" ]] && apply_power_default
+	[[ -n "${FLAG[p]:-}" ]] && apply_power_performance
+
+	[[ -n "${FLAG[a]:-}" ]] && apply_fan_auto
+	[[ -n "${FLAG[c]:-}" ]] && apply_fan_custom
+	[[ -n "${FLAG[m]:-}" ]] && apply_fan_max
+}
+
+main() {
+	if [[ $# -eq 0 ]]; then
+		print_usage
+		exit 0
+	fi
+
+	if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+		print_usage
+		exit 0
+	fi
+
+	needs_root "$@"
+	parse_args "$@"
+
+	if ((${#UNKNOWN_TOKENS[@]} > 0)); then
+		warn "Ignoring unknown tokens: ${UNKNOWN_TOKENS[*]}"
+	fi
+
+	if [[ -n "${FLAG[x]:-}" ]]; then
+		FLAG[r]=1
+	fi
+
+	if ! any_flag_set w q d p a c m r e n; then
+		print_usage
+		exit 1
+	fi
+
+	[[ -n "${FLAG[r]:-}" ]] && dump_ec_registers
+	[[ -n "${FLAG[e]:-}" ]] && print_energy_uj
+	[[ -n "${FLAG[n]:-}" ]] && restart_nvidia_powerd
+
+	run_ec_actions
+}
+
+main "$@"

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=NitroSense Controller
+Comment=Control power and fan profiles on Acer Nitro laptops
+Exec=nitrosense-gui
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Settings;
+StartupNotify=true
