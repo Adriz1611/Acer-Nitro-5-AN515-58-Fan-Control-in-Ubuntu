@@ -69,6 +69,10 @@ Run directly from repo:
 ./nitrosense-gui
 ```
 
+After `.deb` install, launch from Ubuntu app menu using:
+
+- **NitroSense Controller**
+
 GUI features:
 
 - power/fan profile cards
@@ -79,7 +83,7 @@ GUI features:
 
 ### Optional: No Password Prompt Every Time
 
-Install a narrowly scoped sudoers rule for this backend only:
+For repository-local runs, install a narrowly scoped sudoers rule manually:
 
 ```bash
 ./nitrosense-admin sudoers-install
@@ -90,6 +94,11 @@ Remove later with:
 ```bash
 ./nitrosense-admin sudoers-remove
 ```
+
+For `.deb` installs, passwordless execution is enabled by default via:
+
+- `/etc/sudoers.d/nitrosense-gui`
+- rule scope: `/bin/bash /usr/lib/nitrosense/nitrosense *` (for `%sudo` users)
 
 ## Build Debian Package
 
@@ -111,12 +120,15 @@ Install locally:
 sudo apt install ./dist/nitrosense-gui_0.1.0_$(dpkg --print-architecture).deb
 ```
 
+After installation, app actions run without password prompts for users in `sudo` group.
+
 Installed paths are:
 
 - `/usr/bin/nitrosense-gui`
 - `/usr/bin/nitrosense-admin`
 - `/usr/lib/nitrosense/nitrosense`
 - `/usr/share/applications/nitrosense-gui.desktop`
+- `/usr/share/icons/hicolor/scalable/apps/nitrosense-gui.svg`
 
 ## Automatic Debian Builds On GitHub
 

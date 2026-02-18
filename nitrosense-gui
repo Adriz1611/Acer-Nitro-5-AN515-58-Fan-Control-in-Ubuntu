@@ -534,7 +534,7 @@ class NitroSenseWindow(Gtk.ApplicationWindow):
             return False
         try:
             result = subprocess.run(
-                ["sudo", "-n", "true"],
+                ["sudo", "-n", "/bin/bash", self.script_path, "--help"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,

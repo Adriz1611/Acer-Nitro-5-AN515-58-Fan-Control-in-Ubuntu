@@ -118,6 +118,7 @@ build_deb() {
 	[[ -f "${SCRIPT_DIR}/nitrosense" ]] || die "Run from repository root (missing nitrosense)"
 	[[ -f "${SCRIPT_DIR}/README.md" ]] || die "Run from repository root (missing README.md)"
 	[[ -f "${SCRIPT_DIR}/packaging/nitrosense-gui.desktop" ]] || die "Missing packaging/nitrosense-gui.desktop"
+	[[ -f "${SCRIPT_DIR}/packaging/nitrosense-gui.svg" ]] || die "Missing packaging/nitrosense-gui.svg"
 
 	arch="$(dpkg --print-architecture)"
 	build_root="${SCRIPT_DIR}"
@@ -133,6 +134,7 @@ build_deb() {
 	mkdir -p "${build_dir}/usr/lib/nitrosense"
 	mkdir -p "${build_dir}/usr/share/applications"
 	mkdir -p "${build_dir}/usr/share/doc/${pkg_name}"
+	mkdir -p "${build_dir}/usr/share/icons/hicolor/scalable/apps"
 
 	cat > "${build_dir}/DEBIAN/control" <<EOF
 Package: ${pkg_name}
@@ -151,7 +153,42 @@ EOF
 	install -m 755 "${build_root}/nitrosense-admin" "${build_dir}/usr/bin/nitrosense-admin"
 	install -m 755 "${build_root}/nitrosense" "${build_dir}/usr/lib/nitrosense/nitrosense"
 	install -m 644 "${build_root}/packaging/nitrosense-gui.desktop" "${build_dir}/usr/share/applications/nitrosense-gui.desktop"
+	install -m 644 "${build_root}/packaging/nitrosense-gui.svg" "${build_dir}/usr/share/icons/hicolor/scalable/apps/nitrosense-gui.svg"
 	install -m 644 "${build_root}/README.md" "${build_dir}/usr/share/doc/${pkg_name}/README.md"
+
+	cat > "${build_dir}/DEBIAN/postinst" <<'EOF'
+#!/usr/bin/env bash
+set -e
+SUDOERS_FILE="/etc/sudoers.d/nitrosense-gui"
+RULE="%sudo ALL=(root) NOPASSWD: /bin/bash /usr/lib/nitrosense/nitrosense *"
+
+printf '%s\n' "${RULE}" > "${SUDOERS_FILE}"
+chmod 440 "${SUDOERS_FILE}"
+if command -v visudo >/dev/null 2>&1; then
+  visudo -cf "${SUDOERS_FILE}" >/dev/null || {
+    rm -f "${SUDOERS_FILE}"
+    echo "Invalid sudoers file generated: ${SUDOERS_FILE}" >&2
+    exit 1
+  }
+fi
+
+command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database /usr/share/applications || true
+command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q /usr/share/icons/hicolor || true
+exit 0
+EOF
+	chmod 755 "${build_dir}/DEBIAN/postinst"
+
+	cat > "${build_dir}/DEBIAN/postrm" <<'EOF'
+#!/usr/bin/env bash
+set -e
+if [[ "${1:-}" == "remove" || "${1:-}" == "purge" ]]; then
+  rm -f /etc/sudoers.d/nitrosense-gui || true
+  command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database /usr/share/applications || true
+  command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q /usr/share/icons/hicolor || true
+fi
+exit 0
+EOF
+	chmod 755 "${build_dir}/DEBIAN/postrm"
 
 	dpkg-deb --build --root-owner-group "${build_dir}" "${deb_path}"
 	info "Built package: ${deb_path}"
