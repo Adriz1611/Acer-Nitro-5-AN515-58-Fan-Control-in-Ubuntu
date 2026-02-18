@@ -268,13 +268,27 @@ run_ec_actions() {
 	enable_msr_writes
 	ec_write_byte $((0x03)) '\x11'
 
-	[[ -n "${FLAG[q]:-}" ]] && apply_power_quiet
-	[[ -n "${FLAG[d]:-}" ]] && apply_power_default
-	[[ -n "${FLAG[p]:-}" ]] && apply_power_performance
+	if [[ -n "${FLAG[q]:-}" ]]; then
+		apply_power_quiet
+	fi
+	if [[ -n "${FLAG[d]:-}" ]]; then
+		apply_power_default
+	fi
+	if [[ -n "${FLAG[p]:-}" ]]; then
+		apply_power_performance
+	fi
 
-	[[ -n "${FLAG[a]:-}" ]] && apply_fan_auto
-	[[ -n "${FLAG[c]:-}" ]] && apply_fan_custom
-	[[ -n "${FLAG[m]:-}" ]] && apply_fan_max
+	if [[ -n "${FLAG[a]:-}" ]]; then
+		apply_fan_auto
+	fi
+	if [[ -n "${FLAG[c]:-}" ]]; then
+		apply_fan_custom
+	fi
+	if [[ -n "${FLAG[m]:-}" ]]; then
+		apply_fan_max
+	fi
+
+	return 0
 }
 
 main() {
