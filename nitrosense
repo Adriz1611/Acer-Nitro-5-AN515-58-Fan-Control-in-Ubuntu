@@ -146,6 +146,7 @@ ec_write_byte() {
 
 set_power_limits() {
 	local pl1_w="$1" pl2_w="$2" governor="$3"
+	local epp_value
 	local rapl_nodes=(
 		"/sys/devices/virtual/powercap/intel-rapl/intel-rapl:0"
 		"/sys/devices/virtual/powercap/intel-rapl-mmio/intel-rapl-mmio:0"
@@ -156,9 +157,16 @@ set_power_limits() {
 		[[ -w "$gov" ]] && echo "$governor" > "$gov"
 	done
 
+	# EPP accepts values like "power"/"performance", not scaling governor names.
+	case "$governor" in
+		performance) epp_value="performance" ;;
+		powersave) epp_value="power" ;;
+		*) epp_value="balance_power" ;;
+	esac
+
 	local epp
 	for epp in /sys/devices/system/cpu/cpufreq/policy*/energy_performance_preference; do
-		[[ -w "$epp" ]] && echo "$governor" > "$epp"
+		[[ -w "$epp" ]] && echo "$epp_value" > "$epp"
 	done
 
 	local node node_name
@@ -186,11 +194,6 @@ apply_power_quiet() {
 	ec_write_byte $((0x2d)) '\x04'
 	set_power_limits 10 10 "powersave"
 	safe_write "/sys/module/pcie_aspm/parameters/policy" "powersupersave"
-
-	local epp
-	for epp in /sys/devices/system/cpu/cpufreq/policy*/energy_performance_preference; do
-		[[ -w "$epp" ]] && echo power > "$epp"
-	done
 }
 
 apply_power_default() {

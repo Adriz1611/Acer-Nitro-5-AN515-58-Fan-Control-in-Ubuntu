@@ -34,7 +34,7 @@ ec_sys.write_support=1 msr.allow_writes=on
 Recommended packages:
 
 ```bash
-sudo apt install bash python3 python3-gi gir1.2-gtk-3.0 policykit-1 sudo
+sudo apt install bash python3 python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 policykit-1 sudo
 ```
 
 Optional module check:
@@ -73,13 +73,23 @@ After `.deb` install, launch from Ubuntu app menu using:
 
 - **NitroSense Controller**
 
+To start hidden manually (this is what autostart uses):
+
+```bash
+nitrosense-gui --start-hidden
+```
+
 GUI features:
 
 - power/fan profile cards
 - custom fan slider (0-100)
 - quick actions (`n`, `e`, `r`)
 - tray hide/show + quick tray profile actions
+- tray indicator label shows average CPU temperature (refresh every 3 seconds)
 - timestamped command output and status feedback
+- auto-registers as a startup app in `~/.config/autostart/nitrosense-gui.desktop`
+- applies `da` (Default power + Auto fan) automatically on app startup
+- includes in-app controls to disable/re-enable startup registration
 
 ### Optional: No Password Prompt Every Time
 

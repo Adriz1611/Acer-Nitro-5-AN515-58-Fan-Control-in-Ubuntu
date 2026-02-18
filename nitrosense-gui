@@ -5,6 +5,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -15,9 +16,23 @@ gi.require_version("Gdk", "3.0")
 gi.require_version("Gtk", "3.0")
 from gi.repository import GLib, Gdk, Gtk
 
+APPINDICATOR = None
+for _ns in ("AyatanaAppIndicator3", "AppIndicator3"):
+    try:
+        gi.require_version(_ns, "0.1")
+        if _ns == "AyatanaAppIndicator3":
+            from gi.repository import AyatanaAppIndicator3 as APPINDICATOR
+        else:
+            from gi.repository import AppIndicator3 as APPINDICATOR
+        break
+    except (ValueError, ImportError):
+        APPINDICATOR = None
+
 APP_ID = "com.adriz.nitrosense"
 CONFIG_DIR = Path.home() / ".config" / "nitrosense-gui"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+AUTOSTART_DIR = Path.home() / ".config" / "autostart"
+AUTOSTART_FILE = AUTOSTART_DIR / "nitrosense-gui.desktop"
 
 POWER_MODES = {
     "q": {"name": "Quiet", "desc": "Battery-friendly and low-noise"},
@@ -33,14 +48,16 @@ FAN_MODES = {
 
 
 class NitroSenseWindow(Gtk.ApplicationWindow):
-    def __init__(self, app):
+    def __init__(self, app, start_hidden=False):
         super().__init__(application=app, title="NitroSense Controller")
         self.set_default_size(1280, 760)
         self.set_border_width(0)
 
         self.script_path = self._resolve_backend_script()
         self.auth_mode = self._detect_auth_mode()
+        self.start_hidden = start_hidden
         self.running = False
+        self.backend_ready = True
         self.profile_loaded = False
 
         self.power_buttons = {}
@@ -48,8 +65,12 @@ class NitroSenseWindow(Gtk.ApplicationWindow):
         self.selected_power = "d"
         self.selected_fan = "a"
         self.last_command = ""
+        self.autostart_enabled = True
+        self._autostart_toggle_guard = False
         self.quitting = False
-        self.tray = None
+        self.tray_indicator = None
+        self.tray_available = False
+        self.tray_temp_timer_id = None
 
         self._load_css()
 
@@ -109,6 +130,14 @@ class NitroSenseWindow(Gtk.ApplicationWindow):
         self._load_profile()
         self._update_ui_state()
         self._check_prereqs()
+        self._set_autostart_enabled(self.autostart_enabled, persist=False)
+        GLib.idle_add(self._apply_startup_default_profile)
+
+    def _resolve_tray_icon_name(self):
+        theme = Gtk.IconTheme.get_default()
+        if theme is not None and theme.has_icon("nitrosense-gui"):
+            return "nitrosense-gui"
+        return "utilities-system-monitor"
 
     def _resolve_backend_script(self):
         env_path = os.environ.get("NITROSENSE_BACKEND", "").strip()
@@ -126,6 +155,73 @@ class NitroSenseWindow(Gtk.ApplicationWindow):
             if candidate.is_file():
                 return str(candidate.resolve())
         return str((Path(__file__).resolve().parent / "nitrosense").resolve())
+
+    def _resolve_gui_exec(self):
+        argv0 = Path(sys.argv[0]).expanduser()
+        try:
+            if argv0.exists():
+                resolved = argv0.resolve()
+                if os.access(str(resolved), os.X_OK):
+                    return str(resolved)
+        except Exception:
+            pass
+        return shutil.which("nitrosense-gui") or "nitrosense-gui"
+
+    def _autostart_entry_text(self):
+        exec_path = self._resolve_gui_exec()
+        quoted_exec = shlex.quote(exec_path)
+        return (
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=NitroSense Controller\n"
+            "Comment=Start NitroSense controller on login\n"
+            f"Exec={quoted_exec} --start-hidden\n"
+            "Icon=nitrosense-gui\n"
+            "Terminal=false\n"
+            "Categories=System;Settings;\n"
+            "X-GNOME-Autostart-enabled=true\n"
+        )
+
+    def _set_autostart_enabled(self, enabled, persist=True):
+        self.autostart_enabled = bool(enabled)
+        try:
+            if self.autostart_enabled:
+                AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
+                AUTOSTART_FILE.write_text(self._autostart_entry_text(), encoding="utf-8")
+            elif AUTOSTART_FILE.exists():
+                AUTOSTART_FILE.unlink()
+        except Exception as exc:
+            self._append_output(f"[{self._now()}] Failed to update autostart entry: {exc}\n")
+
+        if hasattr(self, "autostart_check"):
+            self._autostart_toggle_guard = True
+            self.autostart_check.set_active(self.autostart_enabled)
+            self.autostart_disable_btn.set_sensitive(self.autostart_enabled)
+            self._autostart_toggle_guard = False
+
+        if persist and self.profile_loaded:
+            self._save_profile(self.selected_power, self.selected_fan, int(self.fan_scale.get_value()))
+
+    def _apply_startup_default_profile(self):
+        if not self.backend_ready:
+            return False
+        self._set_power_mode("d")
+        self._set_fan_mode("a")
+        self._run_backend(["da"], "Startup apply Default + Auto")
+        return False
+
+    def _on_autostart_toggled(self, button):
+        if self._autostart_toggle_guard:
+            return
+        self._set_autostart_enabled(button.get_active())
+        if button.get_active():
+            self._set_status("Autostart enabled", ok=True)
+        else:
+            self._set_status("Autostart disabled", ok=True)
+
+    def _on_disable_autostart_clicked(self, _btn):
+        self._set_autostart_enabled(False)
+        self._set_status("Autostart disabled", ok=True)
 
     def _load_css(self):
         css = b"""
@@ -384,6 +480,17 @@ class NitroSenseWindow(Gtk.ApplicationWindow):
         self.auth_label.get_style_context().add_class("desc")
         info_wrap.pack_start(self.auth_label, False, False, 0)
 
+        pref_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        info_wrap.pack_start(pref_row, False, False, 0)
+
+        self.autostart_check = Gtk.CheckButton(label="Start on login")
+        self.autostart_check.connect("toggled", self._on_autostart_toggled)
+        pref_row.pack_start(self.autostart_check, False, False, 0)
+
+        self.autostart_disable_btn = Gtk.Button(label="Disable")
+        self.autostart_disable_btn.connect("clicked", self._on_disable_autostart_clicked)
+        pref_row.pack_start(self.autostart_disable_btn, False, False, 0)
+
         status_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         panel.pack_end(status_wrap, False, False, 0)
 
@@ -407,26 +514,17 @@ class NitroSenseWindow(Gtk.ApplicationWindow):
         self.apply_btn.add_accelerator("clicked", accel, key_apply, mod_apply, Gtk.AccelFlags.VISIBLE)
 
     def _setup_tray(self):
-        self.tray = Gtk.StatusIcon.new_from_icon_name("preferences-system")
-        self.tray.set_tooltip_text("NitroSense Controller")
-        self.tray.set_visible(True)
-        self.tray.connect("activate", self._on_tray_activate)
-        self.tray.connect("popup-menu", self._on_tray_popup)
+        if APPINDICATOR is None:
+            self.tray_available = False
+            self._append_output(f"[{self._now()}] AppIndicator not available; tray disabled.\n")
+            return
 
-    def _on_tray_activate(self, _icon):
-        if self.is_visible():
-            self.hide()
-        else:
-            self.show_all()
-            self.present()
-
-    def _on_tray_popup(self, icon, button, activate_time):
+        self.tray_available = True
         menu = Gtk.Menu()
 
         show_item = Gtk.MenuItem(label="Show / Hide")
-        show_item.connect("activate", lambda *_: self._on_tray_activate(icon))
+        show_item.connect("activate", self._on_tray_activate)
         menu.append(show_item)
-
         menu.append(Gtk.SeparatorMenuItem())
 
         quick_profiles = [
@@ -445,9 +543,75 @@ class NitroSenseWindow(Gtk.ApplicationWindow):
         quit_item = Gtk.MenuItem(label="Quit")
         quit_item.connect("activate", self._on_tray_quit)
         menu.append(quit_item)
-
         menu.show_all()
-        menu.popup(None, None, Gtk.StatusIcon.position_menu, icon, button, activate_time)
+
+        tray_icon = self._resolve_tray_icon_name()
+        self.tray_indicator = APPINDICATOR.Indicator.new(
+            "nitrosense-gui",
+            tray_icon,
+            APPINDICATOR.IndicatorCategory.APPLICATION_STATUS,
+        )
+        if hasattr(self.tray_indicator, "set_icon_full"):
+            self.tray_indicator.set_icon_full(tray_icon, "NitroSense Controller")
+        self.tray_indicator.set_status(APPINDICATOR.IndicatorStatus.ACTIVE)
+        self.tray_indicator.set_menu(menu)
+
+        if hasattr(self.tray_indicator, "set_secondary_activate_target"):
+            self.tray_indicator.set_secondary_activate_target(show_item)
+
+        self._update_tray_temperature_label()
+        self.tray_temp_timer_id = GLib.timeout_add_seconds(3, self._update_tray_temperature_label)
+
+    def _read_average_cpu_temp(self):
+        base = Path("/sys/class/thermal")
+        if not base.exists():
+            return None
+
+        values = []
+        for zone in sorted(base.glob("thermal_zone*")):
+            temp_file = zone / "temp"
+            type_file = zone / "type"
+            if not temp_file.is_file():
+                continue
+            try:
+                zone_type = type_file.read_text(encoding="utf-8").strip().lower() if type_file.is_file() else ""
+                if not any(key in zone_type for key in ("cpu", "x86_pkg_temp", "package")):
+                    continue
+                raw = int(temp_file.read_text(encoding="utf-8").strip())
+                celsius = raw / 1000.0 if raw > 1000 else float(raw)
+                values.append(celsius)
+            except Exception:
+                continue
+
+        if not values:
+            return None
+        return sum(values) / len(values)
+
+    def _update_tray_temperature_label(self):
+        if not self.tray_available or self.tray_indicator is None:
+            return False
+
+        avg_temp = self._read_average_cpu_temp()
+        if avg_temp is None:
+            label = "N/A"
+            tooltip = "CPU avg temp unavailable"
+        else:
+            label = f"{avg_temp:.1f}C"
+            tooltip = f"NitroSense Controller - CPU avg {avg_temp:.1f}C"
+
+        if hasattr(self.tray_indicator, "set_label"):
+            self.tray_indicator.set_label(label, "99.9C")
+        if hasattr(self.tray_indicator, "set_title"):
+            self.tray_indicator.set_title(tooltip)
+
+        return True
+
+    def _on_tray_activate(self, _source=None):
+        if self.is_visible():
+            self.hide()
+        else:
+            self.show_all()
+            self.present()
 
     def _on_tray_profile_activate(self, _item, power, fan, pct):
         if self.running:
@@ -465,14 +629,19 @@ class NitroSenseWindow(Gtk.ApplicationWindow):
 
     def _on_tray_quit(self, _item):
         self.quitting = True
-        if self.tray is not None:
-            self.tray.set_visible(False)
+        if self.tray_temp_timer_id is not None:
+            GLib.source_remove(self.tray_temp_timer_id)
+            self.tray_temp_timer_id = None
+        if self.tray_indicator is not None and APPINDICATOR is not None:
+            self.tray_indicator.set_status(APPINDICATOR.IndicatorStatus.PASSIVE)
         app = self.get_application()
         if app is not None:
             app.quit()
 
     def _on_delete_event(self, _widget, _event):
         if self.quitting:
+            return False
+        if not self.tray_available:
             return False
         self.hide()
         self._set_status("Window hidden to tray", ok=True)
@@ -502,17 +671,21 @@ class NitroSenseWindow(Gtk.ApplicationWindow):
             ctx.remove_class("status-ok")
 
     def _check_prereqs(self):
+        self.backend_ready = True
         if not os.path.isfile(self.script_path):
             self._set_status(f"Missing backend script: {self.script_path}", ok=False)
             self._set_controls_sensitive(False)
+            self.backend_ready = False
             return
         if not os.access(self.script_path, os.X_OK):
             self._set_status(f"Backend script is not executable: {self.script_path}", ok=False)
             self._set_controls_sensitive(False)
+            self.backend_ready = False
             return
         if self.auth_mode == "pkexec" and shutil.which("pkexec") is None and os.geteuid() != 0:
             self._set_status("pkexec not found. Install policykit-1 or run as root.", ok=False)
             self._set_controls_sensitive(False)
+            self.backend_ready = False
             return
 
         if self.auth_mode == "sudo-n":
@@ -768,6 +941,7 @@ class NitroSenseWindow(Gtk.ApplicationWindow):
         power = "d"
         fan = "a"
         pct = 50
+        autostart_enabled = True
 
         try:
             if CONFIG_FILE.is_file():
@@ -775,6 +949,7 @@ class NitroSenseWindow(Gtk.ApplicationWindow):
                 power = data.get("power", power)
                 fan = data.get("fan", fan)
                 pct = int(data.get("fan_pct", pct))
+                autostart_enabled = bool(data.get("autostart_enabled", autostart_enabled))
         except Exception:
             pass
 
@@ -787,13 +962,22 @@ class NitroSenseWindow(Gtk.ApplicationWindow):
         self._set_power_mode(power)
         self._set_fan_mode(fan)
         self.fan_scale.set_value(pct)
+        self.autostart_enabled = autostart_enabled
         self.profile_loaded = True
 
     def _save_profile(self, power, fan, pct):
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             CONFIG_FILE.write_text(
-                json.dumps({"power": power, "fan": fan, "fan_pct": pct}, indent=2),
+                json.dumps(
+                    {
+                        "power": power,
+                        "fan": fan,
+                        "fan_pct": pct,
+                        "autostart_enabled": self.autostart_enabled,
+                    },
+                    indent=2,
+                ),
                 encoding="utf-8",
             )
         except Exception:
@@ -801,17 +985,22 @@ class NitroSenseWindow(Gtk.ApplicationWindow):
 
 
 class NitroSenseApp(Gtk.Application):
-    def __init__(self):
+    def __init__(self, start_hidden=False):
         super().__init__(application_id=APP_ID)
+        self.start_hidden = start_hidden
 
     def do_activate(self):
-        win = NitroSenseWindow(self)
+        win = NitroSenseWindow(self, start_hidden=self.start_hidden)
         win.show_all()
-        win.present()
+        if self.start_hidden and win.tray_available:
+            win.hide()
+        else:
+            win.present()
 
 
 def main():
-    app = NitroSenseApp()
+    start_hidden = "--start-hidden" in sys.argv
+    app = NitroSenseApp(start_hidden=start_hidden)
     app.run(None)
 
 
