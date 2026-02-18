@@ -83,12 +83,14 @@ GUI features:
 
 - power/fan profile cards
 - custom fan slider (0-100)
+- multi-point fan curve presets (`Silent`, `Balanced`, `Gaming`) in Custom fan mode
 - quick actions (`n`, `e`, `r`)
-- tray hide/show + quick tray profile actions
+- automatic AC/Battery switching (AC -> `Performance + Auto`, Battery -> `Default + Auto`)
+- tray hide/show with live state, checked mode items, and one-click `Restore Safe Mode`
 - tray indicator label shows average CPU temperature (refresh every 3 seconds)
 - timestamped command output and status feedback
 - auto-registers as a startup app in `~/.config/autostart/nitrosense-gui.desktop`
-- applies `da` (Default power + Auto fan) automatically on app startup
+- applies startup profile automatically using AC/Battery rule (or `da` fallback if power source is unavailable)
 - includes in-app controls to disable/re-enable startup registration
 
 ### Optional: No Password Prompt Every Time
